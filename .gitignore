@@ -1,0 +1,14 @@
+__pycache__
+*.pyc
+
+tags
+
+tests/Output
+slowbeast-out
+
+build/
+dist/
+
+sb.spec
+
+*.bc

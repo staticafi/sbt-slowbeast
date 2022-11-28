@@ -1,0 +1,677 @@
+#!/usr/bin/python3
+
+from sys import exit
+import argparse
+from os import mkdir
+from shutil import rmtree
+from os.path import join as pathjoin
+from os.path import basename
+from subprocess import run
+from time import time, process_time
+
+from slowbeast.parsers.llvm.parser import Parser as LLVMParser
+from slowbeast.symexe.symbolicexecution import SEOptions
+from slowbeast.domains.symbolic import to_c_expression
+from slowbeast.util.debugging import set_debugging, dbg, print_stdout, print_stderr
+from slowbeast.ir.instruction import Call
+
+def err(msg):
+    print_stderr(msg, color="RED")
+    exit(1)
+
+def createArgParser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('prog', nargs='+', help='program to be analyzed')
+    parser.add_argument('-dbg', action='store_true', help='write debugging messages')
+    parser.add_argument('-lang', action='store', help='Specify the input'
+                        'language: C, LLVM (forces the file to be compiled to LLVM if'
+                        'lang is LLVM and input file is C)')
+    parser.add_argument('-entry', default='main', help='entry function')
+    parser.add_argument('-out-dir', default='sb-out', help='Directory for output files')
+    parser.add_argument('-interactive', action='store_true', default=False, help='Introspect the run of the algorithm')
+    parser.add_argument('-no-output', action='store_true', default=False, help='Genereate no output (other than stdout/stderr)')
+    parser.add_argument('-verbose', '-v', action='store_true', dest='verbose',
+                        default=False, help='Genereate verbose output')
+    parser.add_argument('-verbose-verbose', '-vv', action='store_true', dest='verbose_v',
+                        default=False, help='Genereate verbose lvl 2 output')
+    parser.add_argument('-verbose-lvl', '-vlvl', type=int, dest='verbose_lvl',
+                        default=1, help='The level of verbose output (the higher, the more verbose)')
+    parser.add_argument('-dbgv', action='store_true', help='Shortcut for -dbg -v')
+    parser.add_argument('-dbgvv', action='store_true', help='Shortcut for -dbg -vv')
+    parser.add_argument('-no-tests', action='store_true', help='Genereate no test files')
+    parser.add_argument('-all-tests', action='store_true', default=False, help='Genereate tests for all paths (not only the erroneous)')
+    parser.add_argument('-pointer-bitwidth', action='store', type=int, help='Set the bitwidth of pointers')
+    parser.add_argument('-concretize-nondet', action='store_true', default=False,
+                        help='Use random value for nondet values, thus follow one random path during execution.')
+    parser.add_argument('-uninitialized-nondet', action='store_true', default=False,
+                        help='Use nondet value for reads from uninitialized memory (instead of issuing an error).')
+    parser.add_argument('-forbid-floats', action='store_true', default=False,
+                        help='Forbid floating-point instructions')
+    parser.add_argument('-dump', action='store_true', default=False, help='dump the program after parsing')
+    parser.add_argument('-parse-only', action='store_true', help='only parse program and dump it (for debugging)')
+    parser.add_argument('-error-fn', action='store', help='Error function (calling this function amounts to calling assert(false)')
+    parser.add_argument('-unsupported-undefs', action='store',
+                        help='Abort on these undefined functions when parsing program (for debugging)')
+    parser.add_argument('-kind', action='store_true', help='Use k-induction in SE (implies SE)')
+    parser.add_argument('-kind-noinv', action='store_true',
+                        help='Use k-induction without (internal) invariant generation')
+    parser.add_argument('-kind-naive', action='store_true',
+                        help='Use naive k-induction on CFG without any improvements')
+    parser.add_argument('-kind-naive-impr', action='store_true',
+                        help='Use improved naive k-induction')
+    parser.add_argument('-cfkind', action='store_true',
+                        help='Use symbolic execution with k-induction and loop folding.')
+    parser.add_argument('-cfkind-til', action='store_true', help='Target towards induction is the last element in KindSE')
+    parser.add_argument('-cfkind-sis', action='store_true', help='Use simple starting inductive sets')
+    parser.add_argument('-kind-step', type=int,
+                        help='Set the step for k-induction, positive number is a number of basic blocks by which to extend in each iteration, 0 is extend the paths until a join, -1 is extend the paths until a branch (default)', default=-1)
+    parser.add_argument('-bse', action='store_true', help='Do backward symbolic execution')
+    parser.add_argument('-bse-add-unwind-inv', action='store_true',
+                        help='Add invariants obtained from succesfull unwinding of a path (default: false)')
+    parser.add_argument('-bself', action='store_true', help='Do backward symbolic execution with loops folding')
+    parser.add_argument('-bself-til', action='store_true', help='Target towards induction is the last element in BSELF')
+    parser.add_argument('-bself-union-extensions-thr', action='store',
+                        default=None,
+                        help='Union extensions of inductive sequences if '
+                             'their number is at least this threshold '
+                             '(0 = always union, default=None)')
+    parser.add_argument('-bself-no-union-matched', action='store_true',
+                        help='Do not union the sets matched in the stored inductive sequences '
+                             'when getting starting inductive sequences')
+    parser.add_argument('-bselff', action='store_true',
+                        help='Do backward symbolic execution with loops folding '
+                             'and forward symbolic execution at the same time')
+    parser.add_argument('-se', action='store_true', default=False,
+                        help='Perform symbolic execution (default).')
+    parser.add_argument('-stateful-se', action='store_true', default=False,
+                        help='Perform stateful symbolic execution (experimental).')
+    parser.add_argument('-future-se', action='store_true', default=False,
+                        help='Perform symbolic execution with on-demand subprograms search (experimental).')
+    parser.add_argument('-se-step', default='instr',
+                        help='Set what is an execution step, one of: block, instr (block = execute the whole blocks instead of single instructions in one step.')
+    parser.add_argument('-se-exit-on-error', action='store_true',
+                        help='Terminate symbolic execution after hitting the first error.')
+    parser.add_argument('-se-replay-errors', action='store_true',
+                        help='Confirm errors by replaying them without symbolic values')
+    parser.add_argument('-se-incremental-solving', action='store_true',
+                        help='Use incremental SMT solving')
+    parser.add_argument('-threads', action='store_true', default=False,
+                        help='Enable handling threads')
+    parser.add_argument('-se-threads-dpor', action='store_true', default=False,
+                        help='Enable DPOR when handling threads (default=false)')
+    parser.add_argument('-ai', action='store_true', default=False,
+                        help='Perform abstract interpretation.')
+   #parser.add_argument('-ai-domain', action='store', default=True,
+   #                    help='Perform abstract interpretation.')
+    #parser.add_argument('-bmc', action='store_true', help='Perform bounded model checking.')
+    parser.add_argument('-external-invariants', action='store', default=None,
+                        help='Instrument code with external invariants '
+                             'before running any analysis. '
+                             'Available options: clam')
+    parser.add_argument('-svcomp-witness', action='store_true',
+                        help='Generate SV-COMP GraphML witnesses.')
+    parser.add_argument('-only-tests', action='store',
+                        help='Generate only tests of a given type. Types can '
+                             'be "err", "killed", "abort", "exited" corresponding '
+                             'to different state statuses',
+                        default=None)
+
+    return parser
+
+def parseArgs():
+    parser = createArgParser()
+    args = parser.parse_args()
+
+    valid_step = ['block', 'instr']
+
+    if not args.se_step in valid_step:
+        err("Invalid -step argument, must be one of: {0}, got '{1}'".format(valid_step, args.step))
+
+    return args
+
+def print_stats(engine):
+    if hasattr(engine, 'executor'):
+        executor = engine.executor()
+        print_stdout(
+            "Executed steps till branch: {0}".format(
+                executor.getExecStepNum()),
+            color='CYAN')
+        print_stdout(
+            "Executed instructions: {0}".format(
+                executor.getExecInstrNum()),
+            color='CYAN')
+        print_stdout(
+            "Executed branch instructions: {0}".format(
+                executor.stats.branchings),
+            color='CYAN')
+        print_stdout(
+            "Number of forks on branches: {0} (forked on {1}% of branches)".format(
+                executor.stats.branch_forks,
+                0 if executor.stats.branchings == 0 else
+                100 *
+                float(
+                    executor.stats.branch_forks) /
+                executor.stats.branchings),
+            color='CYAN')
+        # this includes e.g. forks on assertions/memory resolution/etc.
+        print_stdout(
+            "Number of all forks: {0} (from {1} calls ({2}%) to fork())".format(
+                executor.stats.forks,
+                executor.stats.fork_calls,
+                0 if executor.stats.fork_calls == 0 else
+                100 *
+                float(
+                    executor.stats.forks) /
+                executor.stats.fork_calls),
+            color='CYAN')
+
+
+    print_stdout(
+        "Executed paths: {0}".format(
+            engine.stats.paths),
+        color='CYAN')
+    print_stdout(
+        "Paths that reached exit: {0}".format(
+            engine.stats.exited_paths),
+        color='CYAN')
+    print_stdout(
+        "Paths that abnormally terminated: {0}".format(
+            engine.stats.terminated_paths),
+        color='CYAN')
+    print_stdout(
+        "Killed paths: {0}".format(engine.stats.killed_paths), color='CYAN')
+    print_stdout(
+        "Found errors: {0}".format(
+            engine.stats.errors),
+        color='CYAN')
+
+def _inv_to_c(inv):
+    return f"({to_c_expression(inv.get_cannonical().unwrap())})"
+
+def inv_to_c(inv):
+    return str(" && ".join(map(_inv_to_c, inv)))
+
+class TestCaseGenerator:
+    def __init__(self, outdir='sb-out', alltests=False, svwit=False, only_tests=None):
+        self._outputdir = outdir
+        self._alltests = alltests
+        self._svcomp_witness = svwit
+        self._only_tests = only_tests
+
+    def _openfile(self, path):
+        return open(pathjoin(self._outputdir, path), 'w')
+
+    def processErrorState(self, fl, state):
+        fl.write(state.get_error().descr())
+        fl.write('\n')
+        fl.write('\n')
+        fl.write("Nondeterministic values:\n")
+        inpvec = state.input_vector()
+        for var, val in zip(state.nondets(), inpvec):
+            # dump as unsigned and signed
+            fl.write(f"  {var} -> {val.value()}u")
+            fl.write(" ({0})\n".format(val.value()
+                                       if val.value() < (1 << (val.bitwidth() - 1))
+                                       else (val.value() - (1 << val.bitwidth()))))
+        fl.write('\n')
+        state.dump(stream=fl)
+
+    # FIXME: move out of testgen (it is not generating tests...)
+    def generate_proof(self, executor):
+        invariants = executor.invariants
+        with self._openfile(f"invariants.txt") as fl:
+            write = fl.write
+            for loc, inv in invariants.items():
+                dbgloc = None
+                bblock = loc.elem()
+                for inst in bblock:
+                    dbgloc = inst.get_metadata("dbgloc")
+                    if dbgloc:
+                        break
+                if dbgloc:
+                    write(f"{dbgloc[0]}:{dbgloc[1]}:{dbgloc[2]} {inv_to_c(inv)}\n")
+                else:
+                    write(f"{loc}: {inv_to_c(inv)}\n")
+        if self._svcomp_witness:
+            with self._openfile(f"correctness-witness.graphml") as fl:
+                self.generate_svcomp_correctness_witness(fl, invariants)
+
+
+    def _svcomp_header(self, fl):
+        write = fl.write
+        write("<?xml version='1.0' encoding='UTF-8'?>\n")
+        write('<graphml xmlns="http://graphml.graphdrawing.org/xmlns" '
+                 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n')
+        write('<graph edgedefault="directed">\n\n')
+        write('<node id="0">\n')
+        write('  <data key="entry">true</data>\n')
+        write('</node>\n\n')
+
+    def _svcomp_footer(self, fl):
+        write = fl.write
+        write('</graph>\n')
+        write('</graphml>\n')
+
+    def generate_svcomp_violation_witness(self, fl, state):
+        inpvec = state.input_vector()
+        write = fl.write
+        self._svcomp_header(fl)
+
+        lid = 0
+        for var, val in zip(state.nondets(), inpvec):
+            instruction = var.instruction
+            if not isinstance(instruction, Call):
+                print("Unhandled nondet value: ", var)
+            var = instruction.called_function().name()
+
+            lid += 1
+            # dump as unsigned and signed
+            write(f'<node id="{lid}"/>\n')
+            write(f'<edge source="{lid-1}" target="{lid}">\n')
+            write(f'  <data key="assumption">\\result=={val.value()}</data>\n')
+            write(f'  <data key="assumption.resultfunction">{var}</data>\n')
+            bblock = instruction.bblock()
+            for inst in bblock:
+                dbgloc = inst.get_metadata("dbgloc")
+                if dbgloc:
+                    write(f'  <data key="startline">{dbgloc[1]}</data>\n')
+                    break
+            write('</edge>\n')
+        write(f'<node id="{lid+1}">\n')
+        write('  <data key="violation">true</data>\n')
+        write('</node>\n\n')
+        write(f'<edge source="{lid}" target="{lid+1}"/>\n')
+        self._svcomp_footer(fl)
+
+    def generate_svcomp_correctness_witness(self, fl, invariants):
+        write = fl.write
+        self._svcomp_header(fl)
+        lid = 0
+        for loc, inv in invariants.items():
+            lid += 1
+            # dump as unsigned and signed
+            write(f'<node id="{lid}">\n')
+            cinv = inv_to_c(inv).replace("&&", "&amp;&amp;")
+            write(f'  <data key="invariant">{cinv}</data>\n')
+            write(f'</node>\n')
+            #write(f'<edge source="{lid-1}" target="{lid}">\n')
+            write(f'<edge source="{0}" target="{lid}">\n')
+            bblock = loc.elem()
+            for inst in bblock:
+                dbgloc = inst.get_metadata("dbgloc")
+                if dbgloc:
+                    write(f'  <data key="startline">{dbgloc[1]}</data>\n')
+                    break
+            write('</edge>\n')
+
+        self._svcomp_footer(fl)
+
+    def process_state(self, state):
+        assert not state.is_ready(), state
+
+        if not self._alltests and state.exited():
+            return
+
+        testty = None
+        if state.has_error():
+            testty = "err"
+        elif state.was_killed():
+            testty = "killed"
+        elif state.is_terminated():
+            testty = "abort"
+        else:
+            testty = "exited"
+
+        if self._only_tests and testty not in self._only_tests:
+            return
+
+        filename=f"{state.get_id()}.{testty}.test"
+
+        with self._openfile(filename) as fl:
+            fl.write(str(state.status()))
+            fl.write('\n')
+            if state.has_error():
+                self.processErrorState(fl, state)
+            else:
+                fl.write('\n')
+                state.dump(stream=fl)
+
+        if state.has_error() and self._svcomp_witness:
+            with self._openfile(f"witness-{state.get_id()}.graphml") as fl:
+                self.generate_svcomp_violation_witness(fl, state)
+
+class ThreadedTestCaseGenerator(TestCaseGenerator):
+
+    def generate_svcomp_violation_witness(self, fl, state):
+        inpvec = state.input_vector()
+        write = fl.write
+        self._svcomp_header(fl)
+
+        lid = 0
+        for tid, pc in state.trace():
+            print(tid, pc)
+
+            lid += 1
+            # dump as unsigned and signed
+            write(f'<node id="{lid}"/>\n')
+            write(f'<edge source="{lid-1}" target="{lid}">\n')
+            write(f'  <data key="threadId">{tid}</data>\n')
+            bblock = pc.bblock()
+            for inst in bblock:
+                dbgloc = inst.get_metadata("dbgloc")
+                if dbgloc:
+                    write(f'  <data key="startline">{dbgloc[1]}</data>\n')
+                    break
+            write('</edge>\n')
+        write(f'<node id="{lid+1}">\n')
+        write('  <data key="violation">true</data>\n')
+        write('</node>\n\n')
+        write(f'<edge source="{lid}" target="{lid+1}"/>\n')
+        self._svcomp_footer(fl)
+
+
+
+class OutputsHandler:
+    def __init__(self, testgen, outdir):
+        # test generator
+        self.testgen = testgen
+        # where can the algorithm dump debugging data
+        self.outdir = outdir
+        # stream for logging
+        #self.logstream = logstream
+
+def sort_input_files(files):
+    c_files = []
+    llvm_files = []
+
+    for f in files:
+        if f.endswith('.c') or f.endswith('.i'):
+            c_files.append(f)
+        elif f.endswith('.bc') or f.endswith('.ll'):
+            llvm_files.append(f)
+        else:
+            err("Unknown file: {0}".format(f))
+
+    return c_files, llvm_files
+
+def _run(cmd):
+    dbg("RUN: {0}".format(" ".join(cmd)))
+
+    cp = run(cmd)
+    if cp.returncode != 0:
+        err("Failed running: {0}".format(" ".join(cmd)))
+
+def compile_c(path, outp=None, addargs=None):
+    dbg("Compiling {0}".format(path))
+
+    if outp is None:
+        outp = pathjoin('/tmp/', basename(path) + '.bc')
+
+    cmd = ['clang', '-D__inline=', '-fgnu89-inline', '-emit-llvm', '-c', '-g']
+    if addargs:
+        cmd += addargs
+    cmd += ['-o', outp, path]
+    _run(cmd)
+    dbg("Compiled to {0}".format(outp))
+
+    return outp
+
+def add_clam_invariants(path, outp=None):
+    dbg("Running clam on {0}".format(path))
+
+    if outp is None:
+        outp = pathjoin('/tmp/', basename(path) + '.bc')
+
+    cmd = ['clam.py', '--crab-opt=add-invariants',
+           '--crab-opt-invariants-loc=loop-header',
+           '--crab-print-invariants=false', '-o', outp, path]
+    _run(cmd)
+    dbg("Instrumented to {0}".format(outp))
+
+    return outp
+
+def link_llvm(paths, outp=None, outd='/tmp/'):
+    dbg("Linking {0}".format(paths))
+
+    if outp is None:
+        outp = pathjoin(outd, 'code.bc')
+
+    cmd = ['llvm-link', '-o', outp] + paths
+    _run(cmd)
+
+    dbg("Linked files to {0}".format(outp))
+
+    return outp
+
+def opt(path, opts=[], outp=None, outd='/tmp/'):
+    dbg("Optimizing {0}".format(path))
+
+    if outp is None:
+        outp = pathjoin(outd, 'optcode.bc')
+
+    cmd = ['opt', '-o', outp, path] + opts
+    _run(cmd)
+
+    dbg("Optimized files to {0}".format(outp))
+
+    return outp
+
+def compile_and_link(files, outd, addargs=None):
+    c_files, llvm_files = sort_input_files(files)
+    if c_files:
+        for f in c_files:
+            llvm_files.append(compile_c(f, addargs=addargs))
+
+    assert len(llvm_files) > 0, "No input files"
+    if len(llvm_files) > 1:
+        bitcode = link_llvm(llvm_files, outd=outd)
+    else:
+        bitcode = llvm_files[0]
+
+    return bitcode
+
+def setup_debugging(args):
+    if args.dbgvv:
+        args.dbg = True
+        args.verbose_lvl = max(3, args.verbose_lvl)
+    if args.dbgv:
+        args.dbg = True
+        args.verbose_lvl = max(2, args.verbose_lvl)
+    if args.verbose_v:
+        args.verbose_lvl = max(3, args.verbose_lvl)
+    if args.verbose:
+        args.verbose_lvl = max(2, args.verbose_lvl)
+    if args.dbg:
+        set_debugging(args.verbose_lvl)
+
+def main():
+    # we do not use threads...
+    from sys import setswitchinterval
+    setswitchinterval(100)
+
+    args = parseArgs()
+
+    setup_debugging(args)
+
+    if args.pointer_bitwidth:
+        dbg(f"Setting pointer bitwidth to {args.pointer_bitwidth}")
+        # NOTE: we must do this before building the IR
+        from slowbeast.ir.types import sb_set_pointer_width
+        sb_set_pointer_width(args.pointer_bitwidth)
+
+    parser = None
+    if args.lang:
+        lang = args.lang.lower()
+    else:
+        lang = 'llvm'
+
+    if lang == 'c':
+        from slowbeast.parsers.c.parser import Parser as CParser
+        parser = CParser()
+        code = args.prog
+    elif lang == 'llvm':
+        from slowbeast.parsers.llvm.parser import Parser as LLVMParser
+        error_funs = args.error_fn or None
+        unsupp_undefs = args.unsupported_undefs or None
+        parser = LLVMParser(error_funs.split(',') if error_funs else None,
+                            args.threads, args.forbid_floats,
+                            unsupp_undefs.split(",") if unsupp_undefs else None)
+        code = compile_and_link(args.prog, args.out_dir,
+                                ['-Xclang', '-disable-O0-optnone',
+                                 '-fno-vectorize', '-fno-slp-vectorize']
+                                if args.external_invariants == 'clam' else None)
+        if args.external_invariants == 'clam':
+            code = add_clam_invariants(code)
+    try:
+        P = parser.parse(code)
+    except FileNotFoundError as e:
+        err(str(e))
+
+    if not P:
+        err("Failed parsing the code")
+
+    if args.parse_only:
+        P.dump()
+        exit(0)
+
+    if args.dump:
+        P.dump()
+
+    entry = P.fun(args.entry)
+    if not entry:
+        print("Entry function not found: {0}".format(args.entry))
+        exit(1)
+
+    testgen=None
+    if not args.no_output:
+        try:
+            mkdir(args.out_dir)
+        except OSError:
+            print("The output dir exists, overwriting it")
+            rmtree(args.out_dir)
+            mkdir(args.out_dir)
+
+        with open('{0}/program.txt'.format(args.out_dir), 'w') as f:
+            P.dump(f)
+
+        if not args.no_tests:
+            only_tests = args.only_tests
+            Cls = ThreadedTestCaseGenerator if args.threads else TestCaseGenerator
+            testgen = Cls(args.out_dir,
+                          args.all_tests,
+                          args.svcomp_witness,
+                          only_tests=only_tests.split(",") if only_tests else None)
+
+    ohandler = OutputsHandler(testgen,
+                              None if args.no_output else args.out_dir)
+
+    P.set_entry(entry)
+
+    if args.bself or args.bselff:
+        args.bse = True
+    if args.cfkind:
+        args.kind = True
+    if args.kind or args.bse: # kind implies se
+        args.se = True
+
+    if args.ai and args.se:
+        err("Can run only one technique")
+    if not (args.ai or args.se):
+        args.se = True # no argument means SE
+
+    if args.ai:
+        opts = SEOptions() # FIXME
+        from slowbeast.ai.abstractinterpreter import AbstractInterpreter
+        interpreter = AbstractInterpreter(P, ohandler)
+    elif args.kind:
+        from slowbeast.cfkind import KindSEOptions
+        opts = KindSEOptions()
+
+        if args.cfkind:
+            from slowbeast.cfkind.kindse import KindSEOptions
+            opts = KindSEOptions()
+            if args.cfkind_til:
+                opts.target_is_whole_seq = False
+            if args.cfkind_sis:
+                opts.simple_sis = True
+            from slowbeast.cfkind.kindse import KindSE as KindSymbolicExecutor
+        elif args.kind_naive:
+            from slowbeast.cfkind.naive.naivekindse import KindSymbolicExecutor
+        elif args.kind_naive_impr:
+            from slowbeast.cfkind.naive.naiveimprkindse import KindSymbolicExecutor
+        else: # the default: if args.kind_noinv
+            from slowbeast.cfkind.legacy.noinvkindse import KindSymbolicExecutor
+            # NOTE: now, -kind is the same as -bse. We must implement -bse
+            # with precondition computation of every single step
+        interpreter = KindSymbolicExecutor(P, ohandler, opts)
+    elif args.bse:
+        from slowbeast.bse.bself import BSELFOptions
+        opts = BSELFOptions()
+        opts.replay_errors = args.se_replay_errors
+        if args.bse and not args.bself:
+            opts.fold_loops = False
+        if args.bse_add_unwind_inv:
+            opts.add_unwind_invariants = True
+        if args.bself_til:
+            opts.target_is_whole_seq = False
+        if args.bself_union_extensions_thr is not None:
+            opts.union_extensions_threshold = int(args.bself_union_extensions_thr)
+        if args.bself_no_union_matched:
+            assert opts.union_matched == True
+            opts.union_matched = False
+        if args.bselff:
+            opts.fold_loops = True
+            from slowbeast.bse.bselff import BSELFF as Executor
+        else:
+            from slowbeast.bse.bself import BSELF as Executor
+        interpreter = Executor(P, ohandler, opts)
+    elif args.se:
+        opts = SEOptions()
+
+        opts.threads = args.threads
+        opts.replay_errors = args.se_replay_errors
+        opts.exit_on_error = args.se_exit_on_error
+        opts.interactive = args.interactive
+        opts.incremental_solving = args.se_incremental_solving
+
+        if args.se_step == 'block':
+            opts.setBlockStep()
+
+        if args.stateful_se:
+            assert not args.future_se, "Not compatible at this moment"
+            from slowbeast.symexe.statefulsymbolicexecution import StatefulSymbolicExecutor as SymbolicExecutor
+        elif args.future_se:
+            assert not args.stateful_se, "Not compatible at this moment"
+            from slowbeast.symexe.futuresymbolicexecution import FutureSymbolicExecutor as SymbolicExecutor
+        elif args.threads:
+            if args.se_threads_dpor:
+                from slowbeast.symexe.symbolicexecution import ThreadedDPORSymbolicExecutor as SymbolicExecutor
+            else:
+                from slowbeast.symexe.symbolicexecution import ThreadedSymbolicExecutor as SymbolicExecutor
+        else:
+            from slowbeast.symexe.symbolicexecution import SymbolicExecutor
+        interpreter = SymbolicExecutor(P, ohandler, opts)
+
+    opts.concretize_nondets = args.concretize_nondet
+    opts.uninit_is_nondet = args.uninitialized_nondet
+
+    # user-defined error functions (issue error when called)
+    if args.error_fn:
+        opts.error_funs = args.error_fn.split(',')
+
+    walltime, cputime = time(), process_time()
+    try:
+        interpreter.run()
+        print_stats(interpreter)
+    except KeyboardInterrupt:
+        print_stdout("Interrupted...")
+        print_stats(interpreter)
+    finally:
+        wt = time()-walltime
+        ct = process_time()-cputime
+        print_stdout(f"wall-time: {wt}, cpu-time: {ct}", color="gray")
+
+    exit(0)
+
+if __name__ == "__main__":
+    main()
